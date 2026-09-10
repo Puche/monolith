@@ -17,6 +17,7 @@
 #include "MonolithSourceDatabase.h"
 #include "MonolithSourceSubsystem.h"
 #include "SQLiteDatabase.h"
+#include "MonolithSourceControlActions.h" // save_packages auto_checkout
 
 #if PLATFORM_WINDOWS
 #include "ILiveCodingModule.h"
@@ -556,6 +557,7 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Optional(TEXT("fail_on_unrequested_dirty"), TEXT("bool"), TEXT("If true, abort (saving nothing) when a dirty package outside the request set is found. Default false."), TEXT("false"))
 			.Optional(TEXT("scope_paths"), TEXT("array"), TEXT("Path prefixes that bound the unrequested-dirty pre-scan (only used with fail_on_unrequested_dirty). Omit to scan all dirty packages."))
 			.Optional(TEXT("dry_run"), TEXT("bool"), TEXT("If true, report which packages WOULD be saved (per-package would_save status) without writing anything to disk. Default false."), TEXT("false"))
+			.Optional(TEXT("auto_checkout"), TEXT("bool"), TEXT("Headlessly check out each package via Source Control (ISourceControlProvider) immediately before saving it — skips packages that aren't source-controlled or aren't on disk yet, and never raises the engine's blocking 'Check Out Files?' dialog. No-op when source control isn't enabled. Default true."), TEXT("true"))
 			.Build());
 
 	// --- PIE smoke + capture (F2/F3: PIE/profiling harness plan 2026-06-04) ---
@@ -4727,6 +4729,9 @@ FMonolithActionResult FMonolithEditorActions::HandleSavePackages(const TSharedPt
 	bool bDryRun = false;
 	if (Params.IsValid()) { Params->TryGetBoolField(TEXT("dry_run"), bDryRun); }
 
+	bool bAutoCheckout = true;
+	if (Params.IsValid()) { Params->TryGetBoolField(TEXT("auto_checkout"), bAutoCheckout); }
+
 	// Pre-scan: when requested, abort before saving anything if a dirty package
 	// exists outside the request set (bounded by scope_paths if given).
 	if (bFailOnUnrequested)
@@ -4791,6 +4796,14 @@ FMonolithActionResult FMonolithEditorActions::HandleSavePackages(const TSharedPt
 			if (bWouldSave) { ++SavedCount; }
 			Rows.Add(MakeShared<FJsonValueObject>(Row));
 			continue;
+		}
+
+		if (bAutoCheckout)
+		{
+			// Headless — never raises the engine's "Check Out Files?" modal (that modal's
+			// nested Slate loop would block the game thread and freeze the MCP server).
+			// Merges {source_controlled, checked_out, ...} into Row.
+			FMonolithSourceControlActions::CheckoutPackageForWrite(PackageName, Row);
 		}
 
 		FSavePackageArgs SaveArgs;

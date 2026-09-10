@@ -187,6 +187,11 @@
 			"LoadingPhase": "Default"
 		},
 		{
+			"Name": "MonolithInsights",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
 			"Name": "MonolithGAS",
 			"Type": "Editor",
 			"LoadingPhase": "Default"

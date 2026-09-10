@@ -220,6 +220,11 @@ public:
 	UPROPERTY(config, EditAnywhere, Category="Modules", DisplayName="Enable Mesh Module")
 	bool bEnableMesh = true;
 
+	UPROPERTY(config, EditAnywhere, Category="Modules",
+		meta=(DisplayName="Enable Insights Module",
+			  ToolTip="Registers insights_query actions for in-process .utrace analysis (TraceServices) — frame-window export, thread/timer/counter queries. Independent of UnrealInsights.exe's broken headless CLI export."))
+	bool bEnableInsights = true;
+
 	// --- Optional Module Toggles ---
 
 	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",

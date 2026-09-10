@@ -1,5 +1,6 @@
 #include "MonolithEditorModule.h"
 #include "MonolithEditorActions.h"
+#include "MonolithSourceControlActions.h"
 #include "MonolithEditorMapActions.h"
 #include "MonolithPieObjectActions.h"
 #include "MonolithPieInputActions.h"
@@ -85,6 +86,7 @@ void FMonolithEditorModule::StartupModule()
 	GLog->AddOutputDevice(LogCapture);
 
 	FMonolithEditorActions::RegisterActions(LogCapture);
+	FMonolithSourceControlActions::RegisterActions(FMonolithToolRegistry::Get());  // headless SCC checkout/status/revert
 	FMonolithEditorMapActions::RegisterActions(FMonolithToolRegistry::Get());  // F8: create_empty_map + get_module_status
 	// Gap 8: live-PIE object property read + function call (editor namespace).
 	FMonolithPieObjectActions::RegisterActions(FMonolithToolRegistry::Get());

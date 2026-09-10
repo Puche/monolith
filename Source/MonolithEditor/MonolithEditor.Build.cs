@@ -55,7 +55,11 @@ public class MonolithEditor : ModuleRules
 			// MaterialEditor = UMaterialEditingLibrary (Phase 2 inspect_material_pbr — declared up front so the dep delta lands in one cohesive Build.cs edit).
 			"UMG",
 			"UMGEditor",
-			"MaterialEditor"
+			"MaterialEditor",
+			// Headless Source Control checkout for save_packages (auto_checkout) +
+			// the source_control_status/checkout/revert actions — avoids ever
+			// raising the engine's blocking "Check Out Files?" modal.
+			"SourceControl"
 		});
 
 		if (Target.Platform == UnrealTargetPlatform.Win64)
