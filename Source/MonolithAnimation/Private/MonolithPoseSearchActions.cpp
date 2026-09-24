@@ -1,4 +1,5 @@
 #include "MonolithPoseSearchActions.h"
+#include "Runtime/Launch/Resources/Version.h"
 #include "MonolithAssetUtils.h"
 #include "MonolithParamSchema.h"
 
@@ -887,6 +888,31 @@ static UClass* ResolveChannelClass(const FString& TypeStr)
 }
 
 // ---------------------------------------------------------------------------
+// Database animation-asset write-back (engine-version compat)
+//
+// UE 5.8 deprecated UPoseSearchDatabase::GetMutableDatabaseAnimationAsset in
+// favour of the SetAnimationAssetAt setter, which UE 5.7 does not ship. Handlers
+// therefore read an entry through the const accessor (present on both engines),
+// mutate the copy, and commit it here. Entries live in a plain
+// TArray<FPoseSearchDatabaseAnimationAsset>, so copying does not slice.
+// ---------------------------------------------------------------------------
+
+static void MonolithCommitDatabaseAnimationAsset(
+	UPoseSearchDatabase* Database,
+	const FPoseSearchDatabaseAnimationAsset& Entry,
+	int32 AnimationAssetIndex)
+{
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
+	Database->SetAnimationAssetAt(Entry, AnimationAssetIndex);
+#else
+	if (FPoseSearchDatabaseAnimationAsset* Dest = Database->GetMutableDatabaseAnimationAsset(AnimationAssetIndex))
+	{
+		*Dest = Entry;
+	}
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // set_database_sequence_properties — Wave 14
 // ---------------------------------------------------------------------------
 
@@ -904,12 +930,17 @@ FMonolithActionResult FMonolithPoseSearchActions::HandleSetDatabaseSequencePrope
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid sequence_index %d (database has %d entries)"), SeqIndex, NumAssets));
 
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
-	FMonolithPoseSearchDatabaseEntry* Entry = Database->GetMutableDatabaseAnimationAsset(SeqIndex);
+	const FPoseSearchDatabaseAnimationAsset* SourceEntry = Database->GetDatabaseAnimationAsset(SeqIndex);
 #else
-	FMonolithPoseSearchDatabaseEntry* Entry = Database->GetMutableDatabaseAnimationAsset<FMonolithPoseSearchDatabaseEntry>(SeqIndex);
+	const FMonolithPoseSearchDatabaseEntry* Entry = Database->GetMutableDatabaseAnimationAsset<FMonolithPoseSearchDatabaseEntry>(SeqIndex);
 #endif
-	if (!Entry)
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to get mutable entry at index %d"), SeqIndex));
+
+	if (!SourceEntry)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to get entry at index %d"), SeqIndex));
+
+	// Mutate a copy; MonolithCommitDatabaseAnimationAsset writes it back before every exit.
+	FPoseSearchDatabaseAnimationAsset EntryCopy = *SourceEntry;
+	FPoseSearchDatabaseAnimationAsset* Entry = &EntryCopy;
 
 	GEditor->BeginTransaction(FText::FromString(TEXT("Set PoseSearch Database Sequence Properties")));
 	Database->Modify();
@@ -936,6 +967,7 @@ FMonolithActionResult FMonolithPoseSearchActions::HandleSetDatabaseSequencePrope
 			Entry->MirrorOption = EPoseSearchMirrorOption::UnmirroredAndMirrored;
 		else
 		{
+			MonolithCommitDatabaseAnimationAsset(Database, EntryCopy, SeqIndex);
 			GEditor->EndTransaction();
 			return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid mirror_option: '%s'. Use UnmirroredOnly, MirroredOnly, or UnmirroredAndMirrored"), *MirrorStr));
 		}
@@ -953,6 +985,8 @@ FMonolithActionResult FMonolithPoseSearchActions::HandleSetDatabaseSequencePrope
 		Entry->SetSamplingRange(FFloatInterval(Start, End));
 	}
 #endif // WITH_EDITORONLY_DATA
+
+	MonolithCommitDatabaseAnimationAsset(Database, EntryCopy, SeqIndex);
 
 	GEditor->EndTransaction();
 	Database->MarkPackageDirty();
@@ -1425,6 +1459,10 @@ FMonolithActionResult FMonolithPoseSearchActions::HandleSetDatabaseEntryTags(con
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to get mutable entry at index %d"), EntryIndex));
 
 #if WITH_EDITORONLY_DATA
+	// Mutate a copy; MonolithCommitDatabaseAnimationAsset writes it back before every exit.
+	FPoseSearchDatabaseAnimationAsset EntryCopy = *SourceEntry;
+	FPoseSearchDatabaseAnimationAsset* Entry = &EntryCopy;
+
 	GEditor->BeginTransaction(FText::FromString(TEXT("Set PoseSearch Database Entry Tags")));
 	Database->Modify();
 
@@ -1449,10 +1487,13 @@ FMonolithActionResult FMonolithPoseSearchActions::HandleSetDatabaseEntryTags(con
 			Entry->MirrorOption = EPoseSearchMirrorOption::UnmirroredAndMirrored;
 		else
 		{
+			MonolithCommitDatabaseAnimationAsset(Database, EntryCopy, EntryIndex);
 			GEditor->EndTransaction();
 			return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid mirror_option: '%s'. Use UnmirroredOnly, MirroredOnly, or UnmirroredAndMirrored"), *MirrorStr));
 		}
 	}
+
+	MonolithCommitDatabaseAnimationAsset(Database, EntryCopy, EntryIndex);
 
 	GEditor->EndTransaction();
 	Database->MarkPackageDirty();

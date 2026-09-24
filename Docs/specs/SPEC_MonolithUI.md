@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.21.3 (Beta) — architecture expansion Phase A–L landed 2026-04-26 (plan: [`Docs/plans/2026-04-25-monolith-ui-architecture-expansion.md`](../../../../Docs/plans/2026-04-25-monolith-ui-architecture-expansion.md)); optional EffectSurface provider decouple (Wave 1/2 + Final.1) landed 2026-04-27.
+**Version:** 0.23.0 (Beta) — architecture expansion Phase A–L landed 2026-04-26 (plan: [`Docs/plans/2026-04-25-monolith-ui-architecture-expansion.md`](../../../../Docs/plans/2026-04-25-monolith-ui-architecture-expansion.md)); optional EffectSurface provider decouple (Wave 1/2 + Final.1) landed 2026-04-27.
 
 ---
 
@@ -418,10 +418,24 @@ The Spec System promotes MonolithUI from a flat action toolbox into a schema-dri
 
 | Mode | Effect |
 |---|---|
+| `mode: "rebuild"` | **Default.** Tear the existing widget tree down and recreate it from the spec. Behaviour is unchanged from pre-v0.23.0. |
+| `mode: "patch"` | Reuse existing widgets by id; write only what the spec names. See § Build modes below. |
 | `dry_run: true` | Validate + walk + report a diff; no asset mutation. Returns before package creation, transaction, compile, or save. |
 | `treat_warnings_as_errors: true` | Validator warnings (missing styleRef / animationRef etc.) escalate to errors and abort the build. |
 | `raw_mode: true` | Bypass the per-write allowlist gate (legacy compat for callers that pre-date the gate). |
-| `overwrite: false` | Refuse if an asset already exists at `asset_path`. |
+| `overwrite: false` | Refuse if an asset already exists at `asset_path`. Ignored when `mode: "patch"`. |
+
+### Build modes: `rebuild` vs `patch` (v0.23.0, issue #139)
+
+`build_ui_from_spec` had exactly one behaviour: tear the widget tree down and recreate it. That is correct for authoring a screen from nothing and **silently destructive** for iterating on one — every property the spec schema does not model reset to its class default, with nothing in the response saying so.
+
+**`mode: "patch"`** matches spec nodes to existing widgets by **id + exact class**, reuses those widget and slot objects, reorders them to spec order, and adds or removes only what the spec adds or removes. Custom `WidgetStyle` tints, `BackgroundBlur.BlurStrength`, tooltips, render transforms and unmodelled slot fields survive. An `FText` whose value is unchanged is left untouched, which preserves its localization namespace and key.
+
+**`mode: "rebuild"` now audits before it destroys.** A pre-teardown pass reports every editable property that differs from its class default and is not restored by the spec builders, naming the widget and the dotted path (`Button_Play.WidgetStyle.Normal.TintColor`), plus one warning per keyed `FText` whose loc key the rebuild would reassign. **The audit runs on `dry_run: true` as well**, so the loss can be inspected before it happens.
+
+**An unrecognised `mode` value is rejected with `-32602`. It never falls back to rebuild** — a typo in the mode is exactly the case where a silent default costs the caller their properties.
+
+`ui::build_menu_from_spec` takes the same `mode` and reports `aggregate_data_loss`; `ui::dump_ui_spec_schema` documents both modes under `build_modes`.
 
 **Limits & guards:**
 
@@ -435,7 +449,8 @@ The Spec System promotes MonolithUI from a flat action toolbox into a schema-dri
 ui::build_ui_from_spec({
   spec: <FUISpecDocument JSON>,
   asset_path: "/Game/UI/MyWidget",
-  overwrite: true,             // default
+  mode: "rebuild",             // default; or "patch"
+  overwrite: true,             // default; ignored when mode="patch"
   dry_run: false,              // default
   request_id: "<caller-uuid>", // optional, echoed back
   treat_warnings_as_errors: false,
@@ -449,14 +464,25 @@ ui::build_ui_from_spec({
 {
   bSuccess: bool,
   asset_path: str,
+  mode: "rebuild" | "patch",
+  teardown: bool,
+  error_count: N,
+  warning_count: N,
   request_id?: str,
   validation: { is_valid: bool, llm_report: str },
-  node_counts: { created: N, modified: N, removed: N },
+  node_counts: { created: N, modified: N, removed: N, reused: N, semantics: str },
+  data_loss?: {
+    property_count: N, widget_count: N, widgets_audited: N,
+    localization_keys_reset: N, suppressed: N, advice: str,
+    properties: [{ kind, widget, widget_class, property_path, current_value, resets_to }]
+  },
   errors?: [{ category, widget_id, message, json_path, suggested_fix }],
   warnings?: [{ category, widget_id, message, suggested_fix }],
   diff?: { lines: [str], dry_run: bool }
 }
 ```
+
+**Reading the response (v0.23.0).** `node_counts.semantics` is a prose string spelling out what the counts mean for the mode that ran — `created:N / modified:0 / removed:N` reads like bookkeeping when it actually means the whole tree was destroyed and rebuilt, so the action says so rather than leaving it to be inferred. `data_loss` is present **only** when a teardown was about to drop something. `warnings[]` now includes validator-surface findings, so its length matches `warning_count`.
 
 **`ui::dump_ui_spec_schema`** returns a JSON-Schema-style description of `FUISpecDocument` plus the live allowlist projection per widget type. LLMs use it to build valid spec inputs without crawling our headers.
 
@@ -741,7 +767,7 @@ Slot.* paths (`Slot.Padding`, `Slot.HAlign`, `Slot.VAlign`, `Slot.Anchors`, `Slo
 | Action | Params | Description |
 |--------|--------|-------------|
 | `dump_property_allowlist` | `widget_type` (string) | Returns `{type, registered, container_kind, max_children, widget_class, allowed_paths:[...], allowed_path_count}`. Unknown types return `registered:false` with a hint that the type isn't in the registry. |
-| `add_widget_variable` | `wbp_path`, `var_name`, `var_type`, `default_value?`, `var_category?` | Wraps `FBlueprintEditorUtils::AddMemberVariable` to stamp a user-variable onto a WBP. `var_type` accepts the MCP-friendly token grammar (`bool`/`int`/`int64`/`float`/`double`/`string`/`name`/`text`/`byte`/`object:Class`/`class:Class`/`struct:Name`/`enum:Name`/`softobject:Class`/`softclass:Class`/`exec`/`wildcard`, with container prefixes `array:`/`set:`/`map:Key:Value`). AddMemberVariable defaults flags `CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance` — matches the editor's "add variable" affordance. Phase 2 Item #8 (2026-05-16 UI Gap Audit). |
+| `add_widget_variable` | `wbp_path`, `var_name`, `var_type`, `default_value?`, `var_category?` | Wraps `FBlueprintEditorUtils::AddMemberVariable` to stamp a user-variable onto a WBP. `var_type` accepts the MCP-friendly token grammar (`bool`/`int`/`int64`/`float`/`double`/`string`/`name`/`text`/`byte`/`object:Class`/`class:Class`/`struct:Name`/`enum:Name`/`softobject:Class`/`softclass:Class`/`exec`/`wildcard`, with container prefixes `array:`/`set:`/`map:Key:Value`). AddMemberVariable defaults flags `CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance` — matches the editor's "add variable" affordance. **`enum:` grammar:** `enum:<Name>` builds `PC_Byte` + the `UEnum` as `PinSubCategoryObject`, never `PC_Enum` — see the rule in [SPEC_MonolithBlueprint.md](SPEC_MonolithBlueprint.md). The name resolves as a native enum short name (`enum:ESlateVisibility`, with an `E`-prefix retry so `enum:SlateVisibility` also works), a `UUserDefinedEnum` asset short name, or a full object path (`enum:/Script/UMG.ESlateVisibility`, `enum:/Game/Enums/E_Ammo`). Parsing goes through the shared `MonolithPinTypeGrammar::TryParsePinType`, which fails **by token** — an unresolvable `enum:`/`struct:`/`object:`/`class:`/`softobject:`/`softclass:` sub-object, an unknown base token, or a bad container value type returns `-32602` with the reason instead of silently creating a wrongly-typed variable. Phase 2 Item #8 (2026-05-16 UI Gap Audit); enum grammar corrected for issue #115. |
 | `list_widget_property_enums` | `wbp_path?`, `widget_class?`, `property_name?` | Walks a widget class (or WBP's generated class) and returns every enum-typed property with its enumerator names. Surfaces both `FEnumProperty` (modern `enum class`) AND `FByteProperty` with non-null `Enum` (legacy `TEnumAsByte<EFoo>`). Use to discover the legal value set for `set_widget_property` writes against enum fields. At least one of `wbp_path`/`widget_class` is required. Phase 2 Item #11 (2026-05-16 UI Gap Audit). |
 | `set_widget_is_variable` | `wbp_path` (alias `asset_path`), `widget_name`, `is_variable` (bool) | First-class flip of `UWidget::bIsVariable` — marks or unmarks a tree widget as an exposed Blueprint variable. Calls `Modify()` + a direct member write, then recompiles. Returns `{widget_name, is_variable, changed}` (`changed=false` when the flag already matched). Always-on (not `WITH_COMMONUI`-gated). Phase 4 (2026-05-23 UI Blueprint Gap Audit). |
 
