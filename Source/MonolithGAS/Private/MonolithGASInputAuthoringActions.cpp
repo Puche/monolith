@@ -143,7 +143,7 @@ namespace MonolithInputAuthoring
 			}
 		}
 
-		return Cast<UClass>(StaticFindFirstObject(UClass::StaticClass(), Spec,
+		return Cast<UClass>(StaticFindFirstObject(UClass::StaticClass(), *Spec,
 			EFindFirstObjectOptions::NativeFirst));
 	}
 

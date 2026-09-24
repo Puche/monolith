@@ -895,16 +895,19 @@ static UClass* ResolveChannelClass(const FString& TypeStr)
 // therefore read an entry through the const accessor (present on both engines),
 // mutate the copy, and commit it here. Entries live in a plain
 // TArray<FPoseSearchDatabaseAnimationAsset>, so copying does not slice.
+//
+// UE 5.6 stores entries behind FInstancedStruct, so a base-type copy WOULD
+// slice; there handlers mutate the entry in place and this commit is a no-op.
 // ---------------------------------------------------------------------------
 
 static void MonolithCommitDatabaseAnimationAsset(
 	UPoseSearchDatabase* Database,
-	const FPoseSearchDatabaseAnimationAsset& Entry,
+	const FMonolithPoseSearchDatabaseEntry& Entry,
 	int32 AnimationAssetIndex)
 {
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
 	Database->SetAnimationAssetAt(Entry, AnimationAssetIndex);
-#else
+#elif ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
 	if (FPoseSearchDatabaseAnimationAsset* Dest = Database->GetMutableDatabaseAnimationAsset(AnimationAssetIndex))
 	{
 		*Dest = Entry;
@@ -932,15 +935,21 @@ FMonolithActionResult FMonolithPoseSearchActions::HandleSetDatabaseSequencePrope
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
 	const FPoseSearchDatabaseAnimationAsset* SourceEntry = Database->GetDatabaseAnimationAsset(SeqIndex);
 #else
-	const FMonolithPoseSearchDatabaseEntry* Entry = Database->GetMutableDatabaseAnimationAsset<FMonolithPoseSearchDatabaseEntry>(SeqIndex);
+	FMonolithPoseSearchDatabaseEntry* SourceEntry = Database->GetMutableDatabaseAnimationAsset<FMonolithPoseSearchDatabaseEntry>(SeqIndex);
 #endif
 
 	if (!SourceEntry)
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to get entry at index %d"), SeqIndex));
 
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
 	// Mutate a copy; MonolithCommitDatabaseAnimationAsset writes it back before every exit.
 	FPoseSearchDatabaseAnimationAsset EntryCopy = *SourceEntry;
 	FPoseSearchDatabaseAnimationAsset* Entry = &EntryCopy;
+#else
+	// Mutate in place (see MonolithCommitDatabaseAnimationAsset).
+	FMonolithPoseSearchDatabaseEntry& EntryCopy = *SourceEntry;
+	FMonolithPoseSearchDatabaseEntry* Entry = SourceEntry;
+#endif
 
 	GEditor->BeginTransaction(FText::FromString(TEXT("Set PoseSearch Database Sequence Properties")));
 	Database->Modify();
@@ -1451,17 +1460,23 @@ FMonolithActionResult FMonolithPoseSearchActions::HandleSetDatabaseEntryTags(con
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid entry_index %d (database has %d entries)"), EntryIndex, NumAssets));
 
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
-	FMonolithPoseSearchDatabaseEntry* Entry = Database->GetMutableDatabaseAnimationAsset(EntryIndex);
+	const FPoseSearchDatabaseAnimationAsset* SourceEntry = Database->GetDatabaseAnimationAsset(EntryIndex);
 #else
-	FMonolithPoseSearchDatabaseEntry* Entry = Database->GetMutableDatabaseAnimationAsset<FMonolithPoseSearchDatabaseEntry>(EntryIndex);
+	FMonolithPoseSearchDatabaseEntry* SourceEntry = Database->GetMutableDatabaseAnimationAsset<FMonolithPoseSearchDatabaseEntry>(EntryIndex);
 #endif
-	if (!Entry)
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to get mutable entry at index %d"), EntryIndex));
+	if (!SourceEntry)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to get entry at index %d"), EntryIndex));
 
 #if WITH_EDITORONLY_DATA
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 7
 	// Mutate a copy; MonolithCommitDatabaseAnimationAsset writes it back before every exit.
 	FPoseSearchDatabaseAnimationAsset EntryCopy = *SourceEntry;
 	FPoseSearchDatabaseAnimationAsset* Entry = &EntryCopy;
+#else
+	// Mutate in place (see MonolithCommitDatabaseAnimationAsset).
+	FMonolithPoseSearchDatabaseEntry& EntryCopy = *SourceEntry;
+	FMonolithPoseSearchDatabaseEntry* Entry = SourceEntry;
+#endif
 
 	GEditor->BeginTransaction(FText::FromString(TEXT("Set PoseSearch Database Entry Tags")));
 	Database->Modify();

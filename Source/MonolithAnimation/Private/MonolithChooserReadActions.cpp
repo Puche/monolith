@@ -250,7 +250,7 @@ namespace MonolithChooserRead
 		{
 			// Quiet: a missing /Script/Chooser module is an expected state here, not a fault.
 			ChooserClass = LoadObject<UClass>(nullptr, TEXT("/Script/Chooser.ChooserTable"),
-				FStringView(), LOAD_NoWarn | LOAD_Quiet);
+				nullptr, LOAD_NoWarn | LOAD_Quiet);
 		}
 		return ChooserClass;
 	}
