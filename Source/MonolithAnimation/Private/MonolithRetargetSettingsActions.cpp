@@ -1,4 +1,5 @@
 #include "MonolithRetargetSettingsActions.h"
+#include "Runtime/Launch/Resources/Version.h"
 #include "MonolithAssetUtils.h"
 #include "MonolithParamSchema.h"
 
@@ -751,7 +752,11 @@ FMonolithActionResult FMonolithRetargetSettingsActions::HandleSetRetargetChainSe
 
 		if (bIKChainFound)
 		{
-			IKOp->SetSettings(IKBaseSettings);
+			// FIKRetargetOpBase::SetSettings is deprecated on UE 5.8. Its body is
+			// GetSettings()->CopySettingsAtRuntime() on both engines, and the
+			// IK-chains specialisation lives on the settings struct in 5.7 and 5.8
+			// alike, so this needs no version gate.
+			IKOp->GetSettings()->CopySettingsAtRuntime(IKBaseSettings);
 			bAnyApplied = true;
 		}
 	}
@@ -839,7 +844,9 @@ FMonolithActionResult FMonolithRetargetSettingsActions::HandleSetRetargetRootSet
 #endif
 	}
 
-	PelvisOp->SetSettings(PelvisBaseSettings);
+	// FIKRetargetOpBase::SetSettings is deprecated on UE 5.8; its body is exactly
+	// this call on both engines.
+	PelvisOp->GetSettings()->CopySettingsAtRuntime(PelvisBaseSettings);
 
 	// Optional pelvis bone reassignment (separate setters on the controller).
 	FString SourcePelvis, TargetPelvis;

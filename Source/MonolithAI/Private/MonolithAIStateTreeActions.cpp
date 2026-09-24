@@ -1,4 +1,5 @@
 #include "MonolithAIStateTreeActions.h"
+#include "EdGraph/EdGraph.h"
 #include "MonolithParamSchema.h"
 #include "MonolithAssetUtils.h"
 
@@ -3450,7 +3451,9 @@ FMonolithActionResult FMonolithAIStateTreeActions::HandleAutoArrangeST(const TSh
 
 		// Look for any UEdGraph owned by the StateTree
 		TArray<UObject*> SubObjects;
-		GetObjectsWithOuter(ST, SubObjects, /*bIncludeNestedObjects=*/true);
+		// Nested objects are included by default on both UE 5.7 and 5.8;
+		// the explicit boolean overload is deprecated on 5.8.
+		GetObjectsWithOuter(ST, SubObjects);
 		for (UObject* Sub : SubObjects)
 		{
 			EdGraph = Cast<UEdGraph>(Sub);
@@ -3459,7 +3462,7 @@ FMonolithActionResult FMonolithAIStateTreeActions::HandleAutoArrangeST(const TSh
 
 		if (!EdGraph)
 		{
-			GetObjectsWithOuter(EditorData, SubObjects, /*bIncludeNestedObjects=*/true);
+			GetObjectsWithOuter(EditorData, SubObjects);
 			for (UObject* Sub : SubObjects)
 			{
 				EdGraph = Cast<UEdGraph>(Sub);

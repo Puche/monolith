@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.21.3 (Beta)
+**Version:** 0.23.0 (Beta)
 
 ---
 
@@ -271,7 +271,7 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 | `connect_anim_graph_pins` | Wire two pins inside an ABP graph |
 | `set_state_animation` | Assign an animation asset to a state machine state |
 | `add_variable_get` | Place a `K2Node_VariableGet` in an ABP anim graph for reading AnimInstance member variables. Validates the variable exists on the skeleton class before spawning |
-| `set_anim_graph_node_property` | Set a property on a previously-placed anim graph node via reflection |
+| `set_anim_graph_node_property` | Set a property on a previously-placed anim graph node via reflection. **Scope is authoritative:** a supplied `graph_name` / `state_name` that does not resolve to exactly one graph is an error — it never falls back to the all-graphs search, because node ids repeat across graphs and a fallback silently writes to an unrelated layer. Omitting both keeps the all-graphs search (the documented default). Scope resolution enumerates via `UBlueprint::GetAllGraphs`, so **nested** state machines resolve at any depth (`Standing States → Stop → Stop States → Plant Left Foot`); `state_name` targets a state's inner graph, and pairing it with `graph_name` (the owning state machine) disambiguates sibling states. The response carries `resolved_graph_path` — the root-to-leaf path of the node actually written — beside `old_value` / `new_value`, so a caller can assert *where* a write landed |
 
 **ABP Graph Authoring (14 — ABP-authoring pack)** — namespace `animation`. Pose-composition, slot, cached-pose, output-wiring, blend, sync, layered-blend, Control Rig, and linked-layer anim-graph node authoring. Composes with the existing `add_anim_graph_node` / `connect_anim_graph_pins` write surface.
 
@@ -289,8 +289,18 @@ Wraps `USkeleton::CompatibleSkeletons` — the canonical UE5 mechanism that lets
 | `set_sync_group` | Set a player node's sync group — `name`, `role`, and `method` — so multiple players advance in lockstep. |
 | `set_layered_blend_bones` | Set per-bone branch filters (each a bone + blend depth) on a Layered Blend Per Bone node. |
 | `add_anim_control_rig_node` | Add a Control Rig anim-graph node. Param: `control_rig_class` — its IO pins regenerate from the resolved Control Rig class. |
-| `add_linked_anim_layer` | Add a Linked Anim Layer node. Params: `layer_name`, optional `interface_class`. |
+| `add_linked_anim_layer` | Add a Linked Anim Layer node. Params: `layer_name`, optional `interface_class`, optional `instance_class`. Resolves `layer_name` against the ABP's implemented `UAnimLayerInterface` graphs first; if no interface declares it, falls back to the ABP's OWN anim layer graphs (see ABP-Native Anim Layers below) and binds a SELF layer. Interface layers take precedence when a name exists in both. Supplying `interface_class` disables the native fallback. `instance_class` is rejected for native/self layers — a self layer has no override implementation to point at. |
 | `add_conduit` | Add a conduit node to a state machine. **Its bound graph is a transition-logic graph, not an anim graph** — a conduit routes transitions through a shared rule rather than holding a pose. |
+
+**ABP-Native Anim Layers** — namespace `animation`. Authors an animation layer that belongs to the Animation Blueprint itself, with no `UAnimLayerInterface` asset involved, so ABP variants do not have to share a layer signature.
+
+| Action | Description |
+|--------|-------------|
+| `add_anim_layer_graph` | Create an ABP-NATIVE animation layer: a `UAnimationGraph` carrying `UAnimationGraphSchema` in the Animation Blueprint's own `FunctionGraphs` — exactly what the editor's My Blueprint → **+** → Animation Layer button produces. The anim schema is what makes the anim compiler emit a real `FAnimBlueprintFunction` for the graph (`blueprint add_function` produces an inert K2 graph instead), and the Output Pose root node is created automatically. Params: `asset_path`, `layer_name`, optional `input_poses` (pose NAMES only — `["InPose"]` or `[{"name": "InPose"}]`, capped at 16, unique across the ABP), optional `compile` (default `true`). Returns `asset_path`, `graph_name`, `graph_class`, `schema_class`, `node_count`, `input_poses`, `compiled`, `saved`. Refuses: a duplicate graph name (it never renames or replaces an incumbent graph), the reserved name `AnimGraph`, a child Animation Blueprint (layers belong to the root ABP), macro libraries, interface Blueprints, and duplicate/empty pose names or a non-array `input_poses`. Populate the layer with the anim-graph authoring actions above, then place a consumer node with `add_linked_anim_layer`, which auto-detects native layers. |
+
+**How a native layer reads back.** It reports in `blueprint list_graphs` as `type: "function"` (so does the stock `AnimGraph` — classification is by which array the graph sits in, not by schema), never appears in `blueprint get_interfaces`, and `animation get_linked_layers` shows the consumer node title `"<Layer>\nAnim Layer (self)"`. A self bind is discriminated in the `add_linked_anim_layer` payload by `interface_class: "<self>"` plus `guid_resolved: false`. `add_anim_layer_graph`'s `graph_class` / `schema_class` are the machine-checkable proof that the graph is a `UAnimationGraph` on the anim schema rather than a K2 graph — no other action reports either field.
+
+> **Ordering constraint.** Self-layer pose pins are resolved against the ABP's `SkeletonGeneratedClass` (`UAnimGraphNode_LinkedAnimLayer::GetTargetSkeletonClass` falls back to it when no interface resolves), so the layer graph must already be compiled into that class when the consumer node is placed. `add_anim_layer_graph(compile=false)` immediately followed by `add_linked_anim_layer` places a node with NO pose pins. Use the default `compile=true`, or recompile before placing. Placing the node against a compiled layer regenerates its pose pins — an output `Pose` plus one input pin per declared input pose.
 
 **Fixes (2026-06-07)**
 - `add_anim_graph_node` — fixed a pre-existing crash when spawning bound-graph nodes (BlendStack / MotionMatching); the spawn path now uses `FGraphNodeCreator` so the node's bound graph is constructed correctly.
@@ -401,9 +411,11 @@ Node-level write operations over Animation Blueprint graphs, built for AnimBP re
 
 ---
 
-## Chooser Namespace (10 — namespace: "chooser")
+## Chooser Namespace (16 — namespace: "chooser")
 
-A dedicated namespace for inspecting and editing `UChooserTable` assets, registered from `MonolithAnimation`. **All actions are `#if WITH_CHOOSER` gated** — they register only when the Chooser plugin (`Engine/Plugins/Chooser`) is present. The namespace registers no actions in builds without it.
+A dedicated namespace for inspecting and editing `UChooserTable` assets, registered from `MonolithAnimation`.
+
+**Two registration tiers, and the difference matters.** The 10 authoring/edit actions below are `#if WITH_CHOOSER` gated — they register only when the Chooser plugin (`Engine/Plugins/Chooser`) is present. The **6 read-only actions added in v0.23.0 are NOT gated**: they read `UChooserTable` through reflection only, with no `Chooser.h` include, so they compile and register identically with the plugin enabled or disabled. With it disabled they return an explicit availability error (or, for registry-only discovery, `available=false` metadata) rather than synthesized data.
 
 | Action | Description |
 |--------|-------------|
@@ -422,5 +434,24 @@ A dedicated namespace for inspecting and editing `UChooserTable` assets, registe
 | `add_chooser_column` | Append a column. `column_kind` is `Bool` / `Enum` / `GameplayTag` / `FloatRange` / `OutputObject`. Input (filter) columns take an optional `binding_property` dotted path setting the `InputValue` binding chain. For an `Enum` column, an optional `enum_class` (resolved from an enum path/name) sets the column's enum type so cell values validate against the right `UEnum`. The new column's per-row value array is grown to the table's current row count so all parallel arrays stay aligned. Marks the package dirty. |
 | `add_chooser_row` | Append a row. `cells` is one entry per INPUT column in column order (`Bool`: bool/`any`; `Enum`: int; `FloatRange`: `{min,max}`; `GameplayTag`: tag string); `output_psd` is the asset the row selects (written as an `FAssetChooser` result). Every parallel array (per-column value arrays, `OutputObject` `RowValues`, `ResultsStructs`, `DisabledRows`) grows by exactly 1 atomically. Marks the package dirty. |
 | `set_chooser_cell` | Set a single cell value at `(row, column)` in an existing chooser table. Dispatches per column kind to the matching predicate-cell write (`Bool` → bool/`any`; `Enum` → int validated against the column's `enum_class`; `FloatRange` → `{min,max}`; `GameplayTag` → tag string), keeping the typed predicate arrays aligned. Marks the package dirty. |
+
+**Chooser read-only inspection (6 — new in v0.23.0)** — bounded, non-mutating reads over a `UChooserTable`. Ungated (reflection-only, see the two-tier note above).
+
+| Action | Description |
+|--------|-------------|
+| `list_chooser_tables` | AssetRegistry `UChooserTable` discovery with **boundary-exact** package-prefix filtering — `/Game/Choosers` never matches `/Game/ChoosersOld` — and stable bounded pagination. Params: `path_filter` (canonical mounted long package prefix; aliases and backslash spellings are rejected, not repaired), `offset`, `limit` (1-1000, default 200). Reports `total` + `has_more`, so a truncated page is never mistaken for the whole project. Registry-only, so it answers with metadata (`available=false`) even when the Chooser plugin is disabled |
+| `get_chooser_table` | Bounded summary: row / column / result / cooked-result / disabled-row / nested / context counts, bounded column summaries, the fallback result, and the bounded reference scan with its completeness fields. Params: `asset_path` (required), `include_rows` (default `false`), `row_limit` (1-500, default 50). Strictly read-only — never compiles, saves or dirties |
+| `list_chooser_columns` | Reflected column inventory: per-column struct type, output/input role, disabled state, the **active** row-value property name + element type, and its row-value count. Bounded at 512 columns with an explicit truncation flag. Params: `asset_path` (required) |
+| `list_chooser_rows` | Bounded page of result rows with per-column reflected cell values. Params: `asset_path` (required), `start_row`, `limit` (1-500, default 100). Reports `row_cells_per_row` against `column_count`, so a partially-celled wide row is never mistaken for a complete one, plus `has_more` for the page itself |
+| `list_chooser_references` | Stable, deduplicated page of every hard and soft reference reachable by reflection, each with its source property chain and **exact existence evidence** — a loaded empty package shell or a deleted export reads as `exists=false`. Params: `asset_path` (required), `offset`, `limit` (1-1000, default 200). Reports `scan_truncated` / `scan_depth_limited` / `scan_complete`, so an unfinished walk is never reported as clean |
+| `validate_chooser_table` | Non-mutating structural preflight: per-column row-value alignment against the row count, `ResultsStructs` / `DisabledRows` alignment, result-target validity per result kind, and unresolved soft references. Params: `asset_path` (required). `complete` is false whenever any bound stopped the check short |
+
+> **`validate_chooser_table` is DISTINCT from `validate_chooser` — neither replaces the other.** `validate_chooser` (above) runs `Compile(true)`; it is the compile-oriented pass and it is the one to use when you want the engine's own verdict. `validate_chooser_table` **never compiles, mutates, saves or dirties a package** — it is a structural preflight you can run against content you do not want to touch. The names are close because the surfaces are close; the mutation contract is what separates them.
+
+**Bounding contract.** Every response from the six is finite. Independent table / row / column / reference / depth / field / container / string / global-visit bounds apply, and **each cutoff is reported through an explicit truncation or `complete` field** — a short answer is never indistinguishable from a whole one.
+
+**Two reflection details worth knowing.** Column readback reads the ACTIVE per-row array (`RowValuesWithAny`), not the UHT-registered deprecated `RowValues`, which is why bool columns report their real cell counts rather than zero. And stale `CookedResults` are counted separately rather than being allowed to inflate the authoritative editor row count.
+
+**Path handling.** Canonical paths only. Aliases, redirectors, backslash spellings and case-only variants are **rejected rather than silently normalized** — a read action that repairs its input teaches the caller a path that the write actions will refuse.
 
 ---

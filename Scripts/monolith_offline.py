@@ -1507,8 +1507,62 @@ class SourceActions:
 
 
 # ============================================================
-# Project actions (UNCHANGED — do not touch)
+# Project actions — mirrors Source/MonolithIndex (see project search notes below)
 # ============================================================
+
+# Upper bound on a project search query, mirroring
+# MonolithProjectSearchActionDetail::MaxQueryLength.
+PROJECT_SEARCH_MAX_QUERY_LENGTH = 4096
+
+# Each entry becomes one bound placeholder in an IN clause. Mirrors
+# MonolithProjectSearchActionDetail::MaxClassFilters.
+PROJECT_SEARCH_MAX_CLASS_FILTERS = 32
+
+# Diagnostics emitted by the FTS5 MATCH expression parser rather than by
+# storage/schema access. Mirrors MonolithProjectSearchDetail::IsFts5QuerySyntaxError.
+_FTS5_SYNTAX_ERROR_PATTERNS = (
+    "fts5: syntax error",
+    "unterminated string",
+    "malformed match",
+    "unknown special query",
+    "expected integer, got",
+)
+
+
+def _is_fts5_syntax_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(pattern in lowered for pattern in _FTS5_SYNTAX_ERROR_PATTERNS)
+
+
+def _is_fts5_unknown_column_error(message: str) -> bool:
+    # The two project FTS tables expose different columns, so on its own this
+    # means "not answerable here", not "bad query". Only a rejection by BOTH
+    # tables makes it a caller error.
+    return "no such column" in message.lower()
+
+
+# Mirrors the CREATE VIRTUAL TABLE column lists (fts_assets / fts_nodes).
+_FTS_ASSET_COLUMNS = "asset_name, asset_class, description, package_path, module_name"
+_FTS_NODE_COLUMNS = "node_name, node_class, node_type"
+
+
+def _describe_unknown_column(message: str) -> str:
+    """Name the offending column and list the valid ones.
+
+    Mirrors MonolithProjectSearchDetail::DescribeUnknownColumn.
+    """
+    marker = "no such column:"
+    index = message.lower().find(marker)
+    subject = message
+    if index != -1:
+        column_name = message[index + len(marker):].strip()
+        if column_name:
+            subject = f"no such column '{column_name}'"
+    return (
+        f"{subject}. Valid columns are {_FTS_ASSET_COLUMNS} (assets) or "
+        f"{_FTS_NODE_COLUMNS} (nodes); one filter cannot span both tables."
+    )
+
 
 class ProjectActions:
     def __init__(self):
@@ -1517,19 +1571,78 @@ class ProjectActions:
         self.db = open_db(PROJECT_DB)
 
     def search(self, args):
-        query = args.query
-        limit = args.limit
+        query = (args.query or "").strip()
+        if not query:
+            emit_error("'query' must not be empty")
+            return
+        if len(query) > PROJECT_SEARCH_MAX_QUERY_LENGTH:
+            emit_error(
+                f"'query' must be {PROJECT_SEARCH_MAX_QUERY_LENGTH} characters or fewer "
+                f"(got {len(query)})"
+            )
+            return
+
+        limit = max(1, min(1000, args.limit))
         sqlite3 = self._sqlite3
 
+        # Mirrors the live `asset_class` filter (SPEC_MonolithIndex "Asset-Class
+        # Filtering"). Nothing gates this parity, so it is kept in step by hand.
+        # Comma-separated within each occurrence, so `--asset-class A,B` and a
+        # repeated `--asset-class` both work. The C++ tool's option map is
+        # single-valued and only accepts the comma form, so this keeps the two
+        # tools accepting the same syntax.
+        occurrences = getattr(args, "asset_class", None)
+        class_filter = []
+        if occurrences is not None:
+            seen = set()  # lowercased, mirroring FString's case-insensitive AddUnique
+            for occurrence in occurrences:
+                for entry in (occurrence or "").split(","):
+                    entry = entry.strip()
+                    if entry and entry.lower() not in seen:
+                        seen.add(entry.lower())
+                        class_filter.append(entry)
+            # Present but empty after trimming is a caller mistake, not a request for
+            # unfiltered results -- silently widening the search would be the wrong guess.
+            if not class_filter:
+                emit_error("'asset_class' must name at least one non-empty class")
+                return
+            if len(class_filter) > PROJECT_SEARCH_MAX_CLASS_FILTERS:
+                emit_error(
+                    f"'asset_class' must list {PROJECT_SEARCH_MAX_CLASS_FILTERS} classes or fewer "
+                    f"(got {len(class_filter)})"
+                )
+                return
+
+        # Only the placeholder count is interpolated; the names stay bound.
+        class_predicate = ""
+        if class_filter:
+            placeholders = ",".join("?" for _ in class_filter)
+            class_predicate = f" AND a.asset_class COLLATE NOCASE IN ({placeholders})"
+
         results = []
-        try:
-            rows = self.db.execute(
-                f"""SELECT a.package_path, a.asset_name, a.asset_class, a.module_name,
-                           snippet(fts_assets, 2, '>>>', '<<<', '...', 32) as ctx, rank
-                    FROM fts_assets f JOIN assets a ON a.id = f.rowid
-                    WHERE fts_assets MATCH ? ORDER BY rank LIMIT {limit}""",
-                (query,)
-            ).fetchall()
+        # Per-table verdicts: None = completed, or the unknown-column message.
+        not_applicable = []
+
+        def run_search(sql, table_name):
+            """Returns True to continue, False once a failure has been emitted."""
+            try:
+                # The class filters occupy 2..N+1, so the limit stays last.
+                rows = self.db.execute(sql, (query, *class_filter, limit)).fetchall()
+            except sqlite3.DatabaseError as exc:
+                # DatabaseError (not just OperationalError) so DatabaseCorruptError
+                # is reported as a structured failure instead of a traceback.
+                message = str(exc)
+                if _is_fts5_unknown_column_error(message):
+                    not_applicable.append(message)
+                    return True
+                if _is_fts5_syntax_error(message):
+                    emit_error(f"Invalid FTS5 query: {message}")
+                else:
+                    emit_error(
+                        f"Project search failed: {table_name} FTS query failed: {message}"
+                    )
+                return False
+
             for r in rows:
                 results.append({
                     "asset_path": r["package_path"],
@@ -1539,29 +1652,31 @@ class ProjectActions:
                     "match_context": r["ctx"],
                     "rank": r["rank"],
                 })
-        except sqlite3.OperationalError:
-            pass
+            return True
 
-        try:
-            node_rows = self.db.execute(
-                f"""SELECT a.package_path, a.asset_name, a.asset_class, a.module_name,
-                           snippet(fts_nodes, 0, '>>>', '<<<', '...', 32) as ctx, f.rank
-                    FROM fts_nodes f JOIN nodes n ON n.id = f.rowid
-                    JOIN assets a ON a.id = n.asset_id
-                    WHERE fts_nodes MATCH ? ORDER BY f.rank LIMIT {limit}""",
-                (query,)
-            ).fetchall()
-            for r in node_rows:
-                results.append({
-                    "asset_path": r["package_path"],
-                    "asset_name": r["asset_name"],
-                    "asset_class": r["asset_class"],
-                    "module_name": r["module_name"],
-                    "match_context": r["ctx"],
-                    "rank": r["rank"],
-                })
-        except sqlite3.OperationalError:
-            pass
+        if not run_search(
+            f"""SELECT a.package_path, a.asset_name, a.asset_class, a.module_name,
+                      snippet(fts_assets, 2, '>>>', '<<<', '...', 32) as ctx, rank
+               FROM fts_assets f JOIN assets a ON a.id = f.rowid
+               WHERE fts_assets MATCH ?{class_predicate} ORDER BY rank LIMIT ?""",
+            "assets",
+        ):
+            return
+
+        if not run_search(
+            f"""SELECT a.package_path, a.asset_name, a.asset_class, a.module_name,
+                      snippet(fts_nodes, 0, '>>>', '<<<', '...', 32) as ctx, f.rank
+               FROM fts_nodes f JOIN nodes n ON n.id = f.rowid
+               JOIN assets a ON a.id = n.asset_id
+               WHERE fts_nodes MATCH ?{class_predicate} ORDER BY f.rank LIMIT ?""",
+            "nodes",
+        ):
+            return
+
+        if len(not_applicable) == 2:
+            # No FTS table exposes the requested column.
+            emit_error(f"Invalid FTS5 query: {_describe_unknown_column(not_applicable[0])}")
+            return
 
         results.sort(key=lambda x: x["rank"])
         results = results[:limit]
@@ -2585,6 +2700,9 @@ def build_parser():
     p = prj_sub.add_parser("search")
     p.add_argument("query")
     p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--asset-class", "--asset_class", dest="asset_class", action="append",
+                   help="Restrict to these asset classes (comma-separated and/or repeated, "
+                        "case-insensitive, max 32)")
 
     p = prj_sub.add_parser("find_by_type")
     p.add_argument("asset_class")
